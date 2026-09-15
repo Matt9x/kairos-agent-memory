@@ -48,10 +48,15 @@ export function runDemo() {
     lines.push('reloaded checkpoint: 1 retrieval hit');
 
     const oldIndex = buildMemoryIndex(state);
+    assert.deepEqual(state.claims[0].sources, [{ sourceId: 'source-1', sourceVersion: 'v1', sourceDigest: digest(content) }]);
+    lines.push('historical ref retained: source-1@v1');
     const revised = 'The synthetic participant now prefers water for the afternoon break.';
     state.sources[0] = { ...state.sources[0], content: revised, sourceVersion: 'v2', sourceDigest: digest(revised) };
+    assert.equal(state.sources[0].sourceVersion, 'v2');
+    lines.push('source changed: source-1@v2');
     assert.equal(search(state, oldIndex).length, 0);
-    lines.push('changed source, old index: 0 retrieval hits');
+    assert.equal(search(state).length, 0);
+    lines.push('stale confirmed claim: 0 retrieval hits');
 
     state = reconcileMemorySources(state, request);
     assert.equal(state.claims[0].status, 'needs_review');
@@ -60,7 +65,7 @@ export function runDemo() {
     state = JSON.parse(readFileSync(checkpoint, 'utf8'));
     assert.equal(state.claims[0].status, 'needs_review');
     assert.equal(search(state).length, 0);
-    lines.push('reloaded invalidation: needs_review, 0 retrieval hits');
+    lines.push('reconciled: needs_review, 0 retrieval hits');
 
     state = applyMemoryCommand(state, command('edit', {
       statement: 'Water is the preferred afternoon drink.', sourceVersion: 'v2', sourceDigest: digest('water-claim-v2'),

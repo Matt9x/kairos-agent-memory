@@ -1,6 +1,11 @@
-# Kairos
+# Kairos — Provenance-Aware Long-Term Memory for LLM Agents
 
-Evidence-Grounded Long-Term Memory for LLM Agents
+## At a Glance
+
+- **Problem:** Confirmed memory can become stale when its source changes or disappears.
+- **Mechanism:** Claims store historical source refs; current sources are compared independently for eligibility.
+- **Artifact:** An offline JavaScript memory core, persistence-port projection, synthetic benchmark and demo.
+- **Evidence:** The release-gate run records 77 passing offline tests and a passing demo.
 
 Experimental memory protocols: confirmation, provenance, invalidation,
 conservative retrieval, and persistence contracts. Runs offline with Node.js;
@@ -49,11 +54,12 @@ invalidation explicit so that these behaviors can be inspected and tested.
 - Pure functions for claim confirmation, editing, supersession and archival.
 - Provenance-aware memory eligibility within one explicit context scope.
 - Literal lexical retrieval, explicit manual evidence selection and index rebuild.
-- A storage-port adapter that validates scoped projections, command receipts and
-  observed post-write state, including idempotent retry checks.
+- A storage-port adapter that validates scoped projections, persisted historical
+  source refs, command receipts and observed post-write state, including
+  idempotent retry checks.
 - An offline JSON checkpoint example and synthetic regression tests.
-- A retained synthetic ranking experiment with handcrafted vectors, used to test
-  evaluation and selection rules; it is not a deployed dense retriever.
+- A small synthetic retrieval regression check; it is not a research benchmark
+  or a deployed dense retriever.
 
 The `relationshipId` identifier remains from the original testbed and defines a
 scope boundary. This snapshot has no UI, provider integration, database service
@@ -63,19 +69,22 @@ or application runtime.
 
 ```text
 Caller-supplied observation + version/digest
-  -> candidate claim referencing that source
+  -> candidate claim with persisted historical source refs
   -> explicit confirmation / edit / reconciliation
-  -> claim state and current source eligibility
+  -> claim state and independent current-source comparison
   -> lexical retrieval or manual evidence selection
   -> provenance-bearing records for downstream context
 
 Caller-owned storage port <-> memory persistence adapter
+Persisted claim refs      <-> current source rows for drift comparison
 JSON checkpoint demo      <-> pure memory snapshot
 ```
 
-The caller supplies observations and confirmations. LLM extraction and consuming
-these records in an agent context are not implemented here. The two persistence
-lines represent separate examples/contracts, not a shared production database.
+The caller supplies observations. Confirmation remains an explicit
+caller/user/system action; Kairos does not infer confirmation from source text.
+LLM extraction and consuming these records in an agent context are not
+implemented here. The two persistence lines represent separate
+examples/contracts, not a shared production database.
 
 ## Memory Lifecycle
 
@@ -95,17 +104,20 @@ when called. There is no background expiry scheduler.
 
 ## Provenance and Invalidation
 
-Memory claims reference sources by ID, version and digest. The pure core checks
-those references against the current sources at query time, even when an index
-already exists. Removed, changed, expired or hidden sources can therefore make
-a previously confirmed claim ineligible. `reconcileMemorySources` explicitly
-moves affected claims to review.
+Memory claims persist source refs as `{sourceId, sourceVersion, sourceDigest}`
+records in the public storage field `source_refs_json`. Reloading returns those
+historical refs exactly; the persistence adapter does not reconstruct them from
+current source rows. The pure core then compares each persisted ref with the current
+source independently. Removed,
+changed, expired or hidden sources can therefore make a previously confirmed
+claim ineligible, and `reconcileMemorySources` explicitly moves affected claims
+to review. There is no silent rebind from historical refs to current source state.
 
-Digests and version updates must be maintained by the caller. This is not a
-tamper-proof history system. The persistence adapter projects lineage from the
-storage port's current source rows: a real storage integration must preserve
-confirmation provenance and perform invalidation on source changes. Automatic
-historical-version invalidation across arbitrary storage writers is not proven.
+The adapter fails closed on missing or malformed historical refs, duplicate IDs
+and invalid digest values. A digest is an opaque `non-empty string | null`; a
+missing, empty, numeric, object or array value is invalid. Digests and version
+updates remain caller-owned. This is not a tamper-proof history system, and it
+does not verify semantic truth or entailment of a confirmed claim.
 
 ## Conservative Retrieval
 
@@ -113,11 +125,9 @@ Memory retrieval requires both eligibility and literal matching of every query
 chunk. It does not infer synonyms, aliases or corrected spelling. Manual
 selection is a separate explicit operation that also checks source eligibility.
 
-The synthetic dense-selection gate rejects candidates with eligibility leaks or
-high-harm false positives, even when recall improves. This captures a hypothesis
-that missed recall can be preferable to misleading recall in sensitive contexts;
-it does not establish that lexical matching is universally safer. In particular,
-literal substring matching is not semantic negation understanding, and unresolved
+The snapshot includes a synthetic retrieval regression check only; it does not
+establish general retrieval quality or a deployed ranking method. Literal
+substring matching is not semantic negation understanding, and unresolved
 contradictory confirmed claims can both be returned.
 
 ## Quick Start
@@ -146,8 +156,10 @@ refreshes and confirms the new claim.
 candidate: 0 retrieval hits
 confirmed: 1 retrieval hit
 reloaded checkpoint: 1 retrieval hit
-changed source, old index: 0 retrieval hits
-reloaded invalidation: needs_review, 0 retrieval hits
+historical ref retained: source-1@v1
+source changed: source-1@v2
+stale confirmed claim: 0 retrieval hits
+reconciled: needs_review, 0 retrieval hits
 refreshed and confirmed: tea=0, water=1
 ```
 
@@ -164,20 +176,21 @@ Verified in this standalone snapshot on **2026-09-15**:
 | Command | Passed | Failed | Skipped |
 | --- | ---: | ---: | ---: |
 | `npm run test:memory` | 13 | 0 | 0 |
-| `npm run test:persistence` | 55 | 0 | 0 |
+| `npm run test:persistence` | 63 | 0 | 0 |
 | `node --test tests/offline-demo.test.mjs` | 1 | 0 | 0 |
-| `npm test` | 69 | 0 | 0 |
+| `npm test` | 77 | 0 | 0 |
 
-The original 68 targeted tests remain; one new test checks the repeated offline
-example. Coverage includes scope isolation, state transitions, source changes,
+The original 69 tests remain semantically, with eight new persistence regressions
+for historical refs, source drift, reconciliation, duplicate IDs, digest
+validation and malformed persisted refs; one test checks the repeated offline
+example, bringing the current total to 77. Coverage includes scope isolation,
+state transitions, source changes,
 stale indexes, invalid receipts and writers that report success without applying
 the requested change. No tests are silently skipped to accommodate extraction.
 
-The retained experiment has 16 handcrafted case definitions and generated
-1,000/10,000/50,000-record fixtures. Its printed `device-dense` label describes
-simulated rankings with handcrafted vectors, not a device run or real embeddings.
-Timing checks are desktop smoke bounds, not performance guarantees or paper
-results. No TypeScript compiler or lint configuration is included in this
+The synthetic retrieval check uses generated fixtures and handcrafted vectors
+only for offline regression; it is not device, embedding, performance or paper
+evidence. No TypeScript compiler or lint configuration is included in this
 JavaScript-only snapshot; syntax is checked with Node.
 
 ## Project Structure
@@ -185,7 +198,7 @@ JavaScript-only snapshot; syntax is checked with Node.
 ```text
 src/data/                      required state rules and receipt table vocabulary
 src/features/memory/           memory core and storage-port adapter
-src/features/retrieval/        retained synthetic ranking experiment
+src/features/retrieval/        synthetic retrieval regression check
 tests/                         two original suites and one demo regression
 examples/offline-memory.mjs     asserted synthetic checkpoint walkthrough
 PROVENANCE.md                  source identity, extraction and data classification
@@ -195,7 +208,9 @@ PROVENANCE.md                  source identity, extraction and data classificati
 
 - Research prototype; no production-readiness claim or real-user-data validation.
 - No real-provider evaluation, deployed LLM integration or long-duration agent run.
+- The protocol verifies source identity/version consistency, not semantic truth or entailment of a confirmed claim.
 - No Android real-device persistence verification or native storage integration.
+- No production persistence implementation, real user validation, robot validation or embodied-agent validation.
 - No full lifecycle verification: physical erasure, backup recovery, concurrent
   updates, process-death recovery and scheduled expiry are not established.
 - The storage-port contract depends on correct caller-owned provenance,
@@ -209,28 +224,21 @@ PROVENANCE.md                  source identity, extraction and data classificati
 
 ## Future Research
 
-Not implemented or evaluated in this snapshot: adaptive retrieval, relevance
-reversal, deferred relevance, automatic memory conflict resolution, multimodal
-memory, and memory retrieval in changing physical environments.
+Not implemented or evaluated in this snapshot: adaptive retrieval under changing
+relevance, memory revision in dynamic environments, conflict-aware memory
+maintenance, multimodal memory, and memory for long-horizon embodied agents.
 
 ## Toward Embodied Agents
 
-Kairos currently studies memory protocols for a software-agent setting using
-synthetic inputs. A future direction is to examine related problems in embodied
-agents, where observations are multimodal, environments change over time, and
-stale memory may affect physical decisions.
-
-One possible question is: when should an embodied agent reconsider previously
-dormant memory after new observations change what is relevant? This is a research
-direction, not evidence of robot experiments or implemented VLM/VLA support.
+A future direction is to study how changing observations should alter memory
+eligibility and retrieval priorities in embodied environments.
 
 ## Provenance
 
-Public snapshot derived from **Kairos**, branch `codex/kairos-mobile-v0`,
-commit `bbdc2637914781929099be69403893f86264325c`, snapshot date **2026-09-15**.
-See [PROVENANCE.md](PROVENANCE.md) for source-file hashes, dependency mapping,
-exact extraction changes, data classification and excluded scope. Original Git
-history and non-public operational material are not included.
+This V1.1 public snapshot is derived from the author's private Kairos project.
+See [PROVENANCE.md](PROVENANCE.md) for the included and excluded scope,
+synthetic-data classification, ownership authorization and source statement.
+Original private Git history and non-public operational material are not included.
 
 ## License
 

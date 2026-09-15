@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createMemoryPersistenceAdapter } from '../src/features/memory/memoryPersistenceAdapter.mjs';
+import { reconcileMemorySources } from '../src/features/memory/memoryCore.mjs';
 
 const now = '2026-09-12T00:00:00.000Z';
 const clone = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -16,9 +17,9 @@ function fixture() {
       { id: 'e2', relationship_id: 'r2', content: 'foreign canary', source_version: 'v1', source_digest: 'digest-e2', valid_from: now, valid_until: null, invalidated_at: null },
     ],
     memoryClaims: [
-      { id: 'candidate', relationship_id: 'r1', statement: '她喜欢散步', status: 'candidate', source_version: 'v1', source_digest: 'digest-candidate', lineage_json: '["e1"]', valid_from: now, valid_until: null, invalidated_at: null, created_at: now, updated_at: now },
-      { id: 'confirmed', relationship_id: 'r1', statement: '她喜欢散步', status: 'confirmed', source_version: 'v1', source_digest: 'digest-confirmed', lineage_json: '["e1"]', valid_from: now, valid_until: null, invalidated_at: null, created_at: now, updated_at: now },
-      { id: 'foreign', relationship_id: 'r2', statement: 'foreign canary', status: 'confirmed', source_version: 'v1', source_digest: 'digest-foreign', lineage_json: '["e2"]', valid_from: now, valid_until: null, invalidated_at: null, created_at: now, updated_at: now },
+      { id: 'candidate', relationship_id: 'r1', statement: '她喜欢散步', status: 'candidate', source_version: 'v1', source_digest: 'digest-candidate', source_refs_json: JSON.stringify([{ sourceId: 'e1', sourceVersion: 'v1', sourceDigest: 'digest-e1' }]), valid_from: now, valid_until: null, invalidated_at: null, created_at: now, updated_at: now },
+      { id: 'confirmed', relationship_id: 'r1', statement: '她喜欢散步', status: 'confirmed', source_version: 'v1', source_digest: 'digest-confirmed', source_refs_json: JSON.stringify([{ sourceId: 'e1', sourceVersion: 'v1', sourceDigest: 'digest-e1' }]), valid_from: now, valid_until: null, invalidated_at: null, created_at: now, updated_at: now },
+      { id: 'foreign', relationship_id: 'r2', statement: 'foreign canary', status: 'confirmed', source_version: 'v1', source_digest: 'digest-foreign', source_refs_json: JSON.stringify([{ sourceId: 'e2', sourceVersion: 'v1', sourceDigest: 'digest-e2' }]), valid_from: now, valid_until: null, invalidated_at: null, created_at: now, updated_at: now },
     ],
     receipts: [],
   };
@@ -43,7 +44,7 @@ function fixture() {
         status: desiredClaim.status,
         source_version: desiredClaim.sourceVersion,
         source_digest: desiredClaim.sourceDigest,
-        lineage_json: JSON.stringify(desiredClaim.sources.map((source) => source.sourceId)),
+        source_refs_json: JSON.stringify(desiredClaim.sources),
         valid_from: desiredClaim.validFrom ?? null,
         valid_until: desiredClaim.validUntil ?? null,
         invalidated_at: desiredClaim.invalidatedAt ?? null,
@@ -73,7 +74,7 @@ test('projects only current scoped canonical evidence and claims with explicit p
   const snapshot = await adapter.readScopedMemory({ relationshipId: 'r1', now });
   assert.deepEqual(snapshot.relationships, [{ id: 'r1', state: 'active' }]);
   assert.deepEqual(snapshot.sources.map((source) => [source.id, source.sourceVersion, source.sourceDigest]), [['e1', 'v1', 'digest-e1']]);
-  assert.deepEqual(snapshot.claims.map((claim) => [claim.id, claim.sources[0].sourceId]), [['candidate', 'e1'], ['confirmed', 'e1']]);
+  assert.deepEqual(snapshot.claims.map((claim) => [claim.id, claim.sources[0].sourceId, claim.sources[0].sourceVersion, claim.sources[0].sourceDigest]), [['candidate', 'e1', 'v1', 'digest-e1'], ['confirmed', 'e1', 'v1', 'digest-e1']]);
   assert.equal('database' in adapter, false);
   assert.equal('store' in adapter, false);
   assert.equal('readMemoryScope' in adapter, false);
@@ -148,7 +149,10 @@ test('external source writer explicitly rebuilds the disposable lexical index af
   const adapter = createMemoryPersistenceAdapter(f.port);
   assert.deepEqual((await adapter.searchMemory({ relationshipId: 'r1', now, query: '散步' })).map((row) => row.claimId), ['confirmed']);
   Object.assign(f.state.evidenceItems[0], { content: '晚饭后喝茶', source_version: 'v2', source_digest: 'digest-e1-v2' });
-  Object.assign(f.state.memoryClaims[1], { statement: '她喜欢喝茶', source_version: 'v2', source_digest: 'digest-confirmed-v2' });
+  Object.assign(f.state.memoryClaims[1], {
+    statement: '她喜欢喝茶', source_version: 'v2', source_digest: 'digest-confirmed-v2',
+    source_refs_json: JSON.stringify([{ sourceId: 'e1', sourceVersion: 'v2', sourceDigest: 'digest-e1-v2' }]),
+  });
   await adapter.rebuildLexicalIndex({ relationshipId: 'r1', now });
   assert.deepEqual(await adapter.searchMemory({ relationshipId: 'r1', now, query: '散步' }), []);
   assert.deepEqual((await adapter.searchMemory({ relationshipId: 'r1', now, query: '喝茶' })).map((row) => row.claimId), ['confirmed']);
@@ -278,4 +282,79 @@ test('fails closed before reads or writes when the native canonical port is unav
   const adapter = createMemoryPersistenceAdapter();
   await assert.rejects(adapter.readScopedMemory({ relationshipId: 'r1', now }), { code: 'PERSISTENCE_UNAVAILABLE' });
   await assert.rejects(adapter.execute(request()), { code: 'PERSISTENCE_UNAVAILABLE' });
+});
+
+test('retains persisted historical provenance when the current source mutates', async () => {
+  const f = fixture();
+  const adapter = createMemoryPersistenceAdapter(f.port);
+  Object.assign(f.state.evidenceItems[0], { content: '晚饭后喝茶', source_version: 'v2', source_digest: 'digest-e1-v2' });
+  const snapshot = await adapter.readScopedMemory({ relationshipId: 'r1', now });
+  assert.deepEqual(snapshot.claims.find((claim) => claim.id === 'confirmed').sources, [{ sourceId: 'e1', sourceVersion: 'v1', sourceDigest: 'digest-e1' }]);
+});
+
+test('source drift makes the confirmed historical claim ineligible after reload', async () => {
+  const f = fixture();
+  const adapter = createMemoryPersistenceAdapter(f.port);
+  Object.assign(f.state.evidenceItems[0], { content: '晚饭后喝茶', source_version: 'v2', source_digest: 'digest-e1-v2' });
+  assert.deepEqual(await adapter.searchMemory({ relationshipId: 'r1', now, query: '散步' }), []);
+});
+
+test('reconcile after source drift moves the stale claim to review and invalidates it', async () => {
+  const f = fixture();
+  const adapter = createMemoryPersistenceAdapter(f.port);
+  Object.assign(f.state.evidenceItems[0], { source_version: 'v2', source_digest: 'digest-e1-v2' });
+  const snapshot = await adapter.readScopedMemory({ relationshipId: 'r1', now });
+  const reconciled = reconcileMemorySources(snapshot, { relationshipId: 'r1', now });
+  const claim = reconciled.claims.find((item) => item.id === 'confirmed');
+  assert.equal(claim.status, 'needs_review');
+  assert.equal(claim.invalidatedAt, now);
+});
+
+test('rejects duplicate source IDs before projection', async () => {
+  const f = fixture();
+  f.state.evidenceItems.push({ ...clone(f.state.evidenceItems[0]), content: 'duplicate source row' });
+  await assert.rejects(createMemoryPersistenceAdapter(f.port).readScopedMemory({ relationshipId: 'r1', now }), { code: 'CANONICAL_PROJECTION_INVALID' });
+});
+
+test('rejects duplicate claim IDs before projection', async () => {
+  const f = fixture();
+  f.state.memoryClaims.push({ ...clone(f.state.memoryClaims[0]), statement: 'duplicate claim row' });
+  await assert.rejects(createMemoryPersistenceAdapter(f.port).readScopedMemory({ relationshipId: 'r1', now }), { code: 'CANONICAL_PROJECTION_INVALID' });
+});
+
+test('rejects every non-opaque digest value', async () => {
+  const locations = [
+    (f, value) => value === undefined ? delete f.state.evidenceItems[0].source_digest : f.state.evidenceItems[0].source_digest = value,
+    (f, value) => value === undefined ? delete f.state.memoryClaims[0].source_digest : f.state.memoryClaims[0].source_digest = value,
+    (f, value) => {
+      const ref = { sourceId: 'e1', sourceVersion: 'v1', sourceDigest: value };
+      f.state.memoryClaims[0].source_refs_json = JSON.stringify([ref]);
+    },
+  ];
+  for (const mutate of locations) for (const invalidDigest of ['', 42, {}, [], undefined]) {
+    const f = fixture();
+    mutate(f, invalidDigest);
+    await assert.rejects(createMemoryPersistenceAdapter(f.port).readScopedMemory({ relationshipId: 'r1', now }), { code: 'CANONICAL_PROJECTION_INVALID' });
+  }
+});
+
+test('rejects missing or malformed persisted historical source refs', async () => {
+  for (const persistedRefs of [
+    undefined,
+    JSON.stringify([{ sourceId: 'e1', sourceVersion: 'v1' }]),
+    JSON.stringify([{ sourceId: 'e1', sourceVersion: 'v1', sourceDigest: 42 }]),
+    'not-json',
+  ]) {
+    const f = fixture();
+    if (persistedRefs === undefined) delete f.state.memoryClaims[0].source_refs_json;
+    else f.state.memoryClaims[0].source_refs_json = persistedRefs;
+    await assert.rejects(createMemoryPersistenceAdapter(f.port).readScopedMemory({ relationshipId: 'r1', now }), { code: 'CANONICAL_PROJECTION_INVALID' });
+  }
+});
+
+test('rejects malformed historical refs even when a lifecycle receipt hides the claim', async () => {
+  const f = fixture();
+  delete f.state.memoryClaims[0].source_refs_json;
+  f.state.receipts.push({ id: 'hide-claim', relationshipId: 'r1', status: 'trashed', targets: [{ table: 'memory_claims', id: 'candidate' }] });
+  await assert.rejects(createMemoryPersistenceAdapter(f.port).readScopedMemory({ relationshipId: 'r1', now }), { code: 'CANONICAL_PROJECTION_INVALID' });
 });

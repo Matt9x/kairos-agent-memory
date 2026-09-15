@@ -7,11 +7,33 @@ export class MemoryPersistenceError extends Error {
 }
 
 const text = (value) => typeof value === 'string' && value.trim().length > 0;
+const validDigest = (value) => value === null || text(value);
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const unavailable = () => { throw new MemoryPersistenceError('PERSISTENCE_UNAVAILABLE'); };
 const invalid = () => { throw new MemoryPersistenceError('CANONICAL_PROJECTION_INVALID'); };
 const liveReceipt = (receipt) => receipt.status === 'deleting' || receipt.status === 'trashed';
+
+function validateUniqueIds(rows) {
+  const ids = new Set();
+  for (const row of rows) {
+    if (!object(row) || !text(row.id) || ids.has(row.id)) invalid();
+    ids.add(row.id);
+  }
+}
+
+function historicalRefs(row) {
+  if (!own(row, 'source_refs_json') || typeof row.source_refs_json !== 'string') invalid();
+  let refs;
+  try { refs = JSON.parse(row.source_refs_json); } catch { invalid(); }
+  if (!Array.isArray(refs) || !refs.length) invalid();
+  const ids = new Set();
+  return refs.map((ref) => {
+    if (!object(ref) || !text(ref.sourceId) || !text(ref.sourceVersion) || !own(ref, 'sourceDigest') || !validDigest(ref.sourceDigest) || ids.has(ref.sourceId)) invalid();
+    ids.add(ref.sourceId);
+    return { sourceId: ref.sourceId, sourceVersion: ref.sourceVersion, sourceDigest: ref.sourceDigest };
+  });
+}
 
 function validateReceipts(raw, relationshipId) {
   const rows = { relationships: [raw.relationship], evidence_items: raw.evidenceItems, memory_claims: raw.memoryClaims };
@@ -23,7 +45,7 @@ function validateReceipts(raw, relationshipId) {
     ids.add(receipt.id);
     const targets = new Set();
     for (const target of receipt.targets) {
-      if (!canonicalTables.includes(target.table) || target.table === 'profiles' || (target.table === 'relationships' && target.id !== relationshipId)) invalid();
+      if (!canonicalTables.includes(target.table) || (target.table === 'relationships' && target.id !== relationshipId)) invalid();
       const key = JSON.stringify([target.table, target.id]);
       if (targets.has(key) || (liveReceipt(receipt) && activeTargets.has(key))) invalid();
       targets.add(key);
@@ -41,25 +63,18 @@ function validateReceipts(raw, relationshipId) {
 const receiptHides = (receipts, table, id) => receipts.some((receipt) => liveReceipt(receipt) && receipt.targets.some((target) => target.table === table && target.id === id));
 
 function sourceFrom(row, relationshipId) {
-  if (!object(row) || row.relationship_id !== relationshipId || !text(row.id) || !text(row.content) || !text(row.source_version) || !own(row, 'source_digest')) invalid();
+  if (!object(row) || row.relationship_id !== relationshipId || !text(row.id) || !text(row.content) || !text(row.source_version) || !own(row, 'source_digest') || !validDigest(row.source_digest)) invalid();
   return {
     id: row.id, relationshipId, content: row.content, sourceVersion: row.source_version, sourceDigest: row.source_digest,
     visibility: 'active', validFrom: row.valid_from ?? null, validUntil: row.valid_until ?? null, invalidatedAt: row.invalidated_at ?? null,
   };
 }
 
-function claimFrom(row, relationshipId, sources) {
-  if (!object(row) || row.relationship_id !== relationshipId || !text(row.id) || !text(row.statement) || !text(row.status) || !text(row.source_version) || !own(row, 'source_digest') || !text(row.created_at) || !text(row.updated_at)) invalid();
-  let lineage;
-  try { lineage = JSON.parse(row.lineage_json); } catch { invalid(); }
-  if (!Array.isArray(lineage) || !lineage.length || lineage.some((id) => !text(id)) || new Set(lineage).size !== lineage.length) invalid();
-  const refs = lineage.map((id) => sources.get(id)).map((source) => {
-    if (!source) invalid();
-    return { sourceId: source.id, sourceVersion: source.sourceVersion, sourceDigest: source.sourceDigest };
-  });
+function claimFrom(row, relationshipId) {
+  if (!object(row) || row.relationship_id !== relationshipId || !text(row.id) || !text(row.statement) || !text(row.status) || !text(row.source_version) || !own(row, 'source_digest') || !validDigest(row.source_digest) || !text(row.created_at) || !text(row.updated_at)) invalid();
   return {
     id: row.id, relationshipId, statement: row.statement, status: row.status, sourceVersion: row.source_version, sourceDigest: row.source_digest,
-    sources: refs, visibility: 'active', validFrom: row.valid_from ?? null, validUntil: row.valid_until ?? null, invalidatedAt: row.invalidated_at ?? null,
+    sources: historicalRefs(row), visibility: 'active', validFrom: row.valid_from ?? null, validUntil: row.valid_until ?? null, invalidatedAt: row.invalidated_at ?? null,
     createdAt: row.created_at, updatedAt: row.updated_at,
   };
 }
@@ -68,11 +83,12 @@ function project(raw, relationshipId, now) {
   assertIsoUtcTimestamp(now);
   if (!object(raw) || !object(raw.relationship) || raw.relationship.id !== relationshipId || !Array.isArray(raw.evidenceItems) || !Array.isArray(raw.memoryClaims) || !Array.isArray(raw.receipts)) invalid();
   if (raw.evidenceItems.some((row) => row?.relationship_id !== relationshipId) || raw.memoryClaims.some((row) => row?.relationship_id !== relationshipId)) invalid();
+  validateUniqueIds(raw.evidenceItems);
+  validateUniqueIds(raw.memoryClaims);
   validateReceipts(raw, relationshipId);
   if (raw.relationship.state !== 'active' || receiptHides(raw.receipts, 'relationships', relationshipId)) throw new MemoryPersistenceError('SCOPE_HIDDEN');
-  const sources = raw.evidenceItems.filter((row) => !receiptHides(raw.receipts, 'evidence_items', row.id)).map((row) => sourceFrom(row, relationshipId));
-  const sourceMap = new Map(sources.map((source) => [source.id, source]));
-  const claims = raw.memoryClaims.filter((row) => !receiptHides(raw.receipts, 'memory_claims', row.id)).map((row) => claimFrom(row, relationshipId, sourceMap));
+  const sources = raw.evidenceItems.map((row) => sourceFrom(row, relationshipId)).filter((source) => !receiptHides(raw.receipts, 'evidence_items', source.id));
+  const claims = raw.memoryClaims.map((row) => claimFrom(row, relationshipId)).filter((claim) => !receiptHides(raw.receipts, 'memory_claims', claim.id));
   return { relationships: [{ id: relationshipId, state: 'active' }], sources, claims };
 }
 
@@ -90,14 +106,14 @@ function commandCopy(command) {
     copy.replacementClaimId = command.replacementClaimId;
   }
   if (command.kind === 'edit') {
-    if (!text(command.statement) || !text(command.sourceVersion) || (command.sourceDigest != null && !text(command.sourceDigest))) bad();
+    if (!text(command.statement) || !text(command.sourceVersion) || (own(command, 'sourceDigest') && !validDigest(command.sourceDigest))) bad();
     copy.statement = command.statement;
     copy.sourceVersion = command.sourceVersion;
     if (own(command, 'sourceDigest')) copy.sourceDigest = command.sourceDigest ?? null;
     if (own(command, 'sources')) {
       if (!Array.isArray(command.sources) || !command.sources.length) bad();
       copy.sources = command.sources.map((ref) => {
-        if (!object(ref) || !text(ref.sourceId) || !text(ref.sourceVersion) || !own(ref, 'sourceDigest') || (ref.sourceDigest !== null && !text(ref.sourceDigest))) bad();
+        if (!object(ref) || !text(ref.sourceId) || !text(ref.sourceVersion) || !own(ref, 'sourceDigest') || !validDigest(ref.sourceDigest)) bad();
         return { sourceId: ref.sourceId, sourceVersion: ref.sourceVersion, sourceDigest: ref.sourceDigest };
       });
     }
